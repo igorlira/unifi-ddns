@@ -13,30 +13,40 @@ class HttpError extends Error {
 }
 
 function constructClientOptions(request: Request): ClientOptions {
+	const url = new URL(request.url);
+	const params = url.searchParams;
 	const authorization = request.headers.get('Authorization');
-	if (!authorization) {
+	const emailParam = params.get('a');
+	const tokenParam = params.get('t');
+
+	if (authorization) {
+		const [, data] = authorization.split(' ');
+		const decoded = atob(data);
+		const index = decoded.indexOf(':');
+
+		if (index === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
+			throw new HttpError(401, 'Invalid API key or token.');
+		}
+
+		return {
+			apiEmail: decoded.substring(0, index),
+			apiToken: decoded.substring(index + 1),
+		};
+	} else if (tokenParam) {
+		return {
+			...(emailParam ? { apiEmail: emailParam } : {}),
+			apiToken: tokenParam,
+		}
+	} else {
 		throw new HttpError(401, 'API token missing.');
 	}
-
-	const [, data] = authorization.split(' ');
-	const decoded = atob(data);
-	const index = decoded.indexOf(':');
-
-	if (index === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
-		throw new HttpError(401, 'Invalid API key or token.');
-	}
-
-	return {
-		apiEmail: decoded.substring(0, index),
-		apiToken: decoded.substring(index + 1),
-	};
 }
 
 function constructDNSRecord(request: Request): AddressableRecord {
 	const url = new URL(request.url);
 	const params = url.searchParams;
 	let ip = params.get('ip') || params.get('myip');
-	const hostname = params.get('hostname');
+	const hostname = (params.get('hostname') || '').replace('wildcard.', '*.')
 
 	if (ip === null || ip === undefined) {
 		throw new HttpError(422, 'The "ip" parameter is required and cannot be empty. Specify ip=auto to use the client IP.');
@@ -59,7 +69,7 @@ function constructDNSRecord(request: Request): AddressableRecord {
 	};
 }
 
-async function update(clientOptions: ClientOptions, newRecord: AddressableRecord): Promise<Response> {
+async function update(clientOptions: ClientOptions, newRecord: AddressableRecord, zoneName: string): Promise<Response> {
 	const cloudflare = new Cloudflare(clientOptions);
 
 	const tokenStatus = (await cloudflare.user.tokens.verify()).status;
@@ -68,13 +78,15 @@ async function update(clientOptions: ClientOptions, newRecord: AddressableRecord
 	}
 
 	const zones = (await cloudflare.zones.list()).result;
-	if (zones.length > 1) {
-		throw new HttpError(400, 'More than one zone was found! You must supply an API Token scoped to a single zone.');
-	} else if (zones.length === 0) {
-		throw new HttpError(400, 'No zones found! You must supply an API Token scoped to a single zone.');
+	// if (zones.length > 1) {
+	// 	throw new HttpError(400, 'More than one zone was found! You must supply an API Token scoped to a single zone.');
+	// } else if (zones.length === 0) {
+	// 	throw new HttpError(400, 'No zones found! You must supply an API Token scoped to a single zone.');
+	// }
+	const zone = zones.find((z) => z.name === zoneName);
+	if (!zone) {
+		throw new HttpError(400, 'No zone found! You must supply an API Token scoped to at least one zone.');
 	}
-
-	const zone = zones[0];
 
 	const records = (
 		await cloudflare.dns.records.list({
@@ -111,17 +123,26 @@ async function update(clientOptions: ClientOptions, newRecord: AddressableRecord
 
 export default {
 	async fetch(request): Promise<Response> {
+		const url = new URL(request.url);
+		const params = url.searchParams;
+		const zoneName = params.get('z');
+
 		console.log('Requester IP: ' + request.headers.get('CF-Connecting-IP'));
 		console.log(request.method + ': ' + request.url);
 		console.log('Body: ' + (await request.text()));
+		console.log('Zone: ' + zoneName);
 
 		try {
+			if (!zoneName) {
+				throw new HttpError(422, 'Zone name required');
+			}
+
 			// Construct client options and DNS record
 			const clientOptions = constructClientOptions(request);
 			const record = constructDNSRecord(request);
 
 			// Run the update function
-			return await update(clientOptions, record);
+			return await update(clientOptions, record, zoneName);
 		} catch (error) {
 			if (error instanceof HttpError) {
 				console.log('Error updating DNS record: ' + error.message);
